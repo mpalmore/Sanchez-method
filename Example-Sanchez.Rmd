@@ -1,0 +1,212 @@
+---
+title: "Example analysis from Sanchez et al in R"
+author: "Meredith Palmore"
+date: "2025-08-27"
+output: 
+  html_document:
+  toc: true
+  toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(MASS)
+set.seed(1234)
+```
+
+# Simulate some longitudinal data 
+
+4 columns for time, 1 column for outcome. 
+
+```{r, collapse=TRUE}
+# size of the covariance matrix
+p <- 5  
+
+# make a matrix filled with covariance of 0.5
+Sigma <- matrix(0.5, nrow = p, ncol = p)
+
+# set diagonals to 1 (variances)
+diag(Sigma) <- 1
+
+Sigma
+
+mu_vector<-rep(0,5)
+
+simulated_data <- mvrnorm(n = 27, mu = mu_vector, Sigma = Sigma)
+
+colnames(simulated_data)<-c("T1","T2","T3","T4","Outcome")
+
+simulated_data<-as.data.frame(simulated_data)
+
+simulated_data$participantid<-c(1:27)
+
+simulated_data$sex<-c(rep("Female", 9), rep( "Male",18))
+```
+
+
+
+# Create a variable for outcome Qtile. This will be used for the plot at the end of the analysis.
+
+```{r}
+simulated_data$Outcome_qtile<-ntile(simulated_data$Outcome, n = 4)
+```
+
+To simulate real life data, set rows where there is a missing observation at certain timepoints
+
+```{r, collapse=T}
+set.seed(1234)
+simulated_data$T1[sample(1:nrow(simulated_data),size=5)]<-NA
+simulated_data$T2[sample(1:nrow(simulated_data),size=5)]<-NA
+simulated_data$T3[sample(1:nrow(simulated_data),size=5)]<-NA
+simulated_data$T4[sample(1:nrow(simulated_data),size=5)]<-NA
+```
+
+# Create a long dataset from the wide data:
+
+Participants have 1 row per time point
+
+```{r}
+simulated_data_long <- pivot_longer(simulated_data, cols = starts_with("T"),
+                            names_to = "time_meas", values_to = "log_phalate") %>%
+  mutate(
+    time = parse_number(time_meas)
+  ) %>%
+  dplyr::select(participantid, time, log_phalate, Outcome, Outcome_qtile, sex)
+
+head(simulated_data_long, n = 10)
+```
+
+# Visually check which polynomial model seems like a reasonable fit 
+
+```{r}
+ggplot(simulated_data_long, aes(x = as.numeric(time), y = log_phalate)) +
+  geom_point() +
+  geom_smooth(method="lm", formula= y~poly(x, 2), se = F, color = "red") + 
+  ylab("Phalate")
+
+ggplot(simulated_data_long, aes(x = as.numeric(time), y = log_phalate)) +
+  geom_point() +
+  geom_smooth(method="lm", formula= y~poly(x, 3), se = F, color = "red") + 
+  ylab("Phalate")
+```
+
+
+Compare the effect of the exposure on the outcome at each time point to identify any obvious critical windows of exposure:
+
+
+```{r}
+subset(simulated_data_long, simulated_data_long$time==1) %>% lm(., formula = Outcome ~ log_phalate)
+subset(simulated_data_long, simulated_data_long$time==2) %>% lm(., formula = Outcome ~ log_phalate)
+subset(simulated_data_long, simulated_data_long$time==3) %>% lm(., formula = Outcome ~ log_phalate)
+subset(simulated_data_long, simulated_data_long$time==4) %>% lm(., formula = Outcome ~ log_phalate)
+
+```
+
+The effect estimate at times 2+3 are higher, and times 1 and 4 are smaller. I would like to try to fit a polynomial 2 (one inflection point) AND a polynomial 3 relationship (two inflection points in the line). I will compare these models to a linear time interaction model. 
+
+# Step 1: Regress the outcomes on the covariates and obtain the residuals. This is the "Outcome model" in Sanchez
+
+```{r}
+out_mod<-lm(Outcome ~ sex, data = simulated_data)
+
+residuals<-out_mod$residuals
+
+simulated_data<-cbind(simulated_data, residuals)
+```
+
+Prepare dataset for step 2
+
+Merge the residuals from the outcome model with the long dataset by participantid.
+
+```{r}
+simulated_data_long<-merge(simulated_data_long, simulated_data[,c("participantid", "residuals")], by = "participantid" )
+```
+
+# Step 2: Predict the exposure from the residuals of the outcome, allowing the effect to vary over time (in a nonlinear way). This is the "Exposure model" in Sanchez et al. 
+
+## ANOVA for the nonlinear effect of time point on exposure vs the linear effect
+
+```{r}
+exp_mod_poly2<-lm(log_phalate ~ time + I(time^2) + residuals + time*residuals + I(time^2)*residuals, data = simulated_data_long)
+```
+
+```{r}
+# Null model for anova no nonlinear effect of time:
+mod_0<-lm(log_phalate ~ time +residuals + time*residuals, data = simulated_data_long)
+```
+
+The polynomial 2 time relationship does not fit better than linear relationship
+
+```{r}
+anova(mod_0, exp_mod_poly2)
+```
+
+Try a polynomial 3 relationship (2 inflection points)
+
+```{r}
+exp_mod_poly3<-lm(log_phalate ~ time + I(time^2) + + I(time^3) + 
+                    residuals + time*residuals + I(time^2)*residuals + I(time^3)*residuals, data = simulated_data_long)
+```
+
+Polynomial 3 relationship fits better than a linear time relationship:
+
+```{r}
+anova(mod_0, exp_mod_poly3)
+```
+
+## ANOVA for whether the outcome adds any predictive value for the exposure vs no outcome in the model
+
+Need to change the null model for the ANOVA to test this:
+
+```{r}
+mod_0<-lm(log_phalate ~ time + I(time^2) + I(time^3), data = simulated_data_long)
+```
+
+Adding residuals of the outcome variable to the model DOES improve the prediction of the exposure:
+
+Pr(>F)  = 1.073e-05
+
+```{r}
+anova(mod_0, exp_mod_poly3)
+```
+
+```{r}
+summary(exp_mod_poly3)
+```
+
+# Plot the predicted exposure patterns based on the outcome and time point
+
+Predict the exposure level based on the Exposure Model from Step 2:
+
+```{r}
+predicted_log_phalate<-predict(exp_mod_poly3, newdata = simulated_data_long) # prediction
+predicted_log_phalate_se<-predict(exp_mod_poly3, newdata = simulated_data_long, se.fit = T)$se.fit # standard error
+simulated_data_long_plot<-cbind(cbind(simulated_data_long, predicted_log_phalate), predicted_log_phalate_se)
+```
+
+Restrict to extremes for comparison of the predicted exposure levels over time
+
+```{r}
+# Compare outcome from the 1st and 4th quartile (i think the Sanchez paper did 1st and 10th, though)
+simulated_data_long_plot_ext<-simulated_data_long_plot %>%
+  filter(Outcome_qtile==1 | Outcome_qtile==4) %>%
+  mutate(Outcome_extremes = factor(Outcome_qtile, levels = c(1,4), labels = c("Quartile 1", "Quartile 4")))
+
+simulated_data_long_plot_ext$LCI<-as.numeric(simulated_data_long_plot_ext$predicted_log_phalate) - 1.96*as.numeric(simulated_data_long_plot_ext$predicted_log_phalate_se)
+
+simulated_data_long_plot_ext$UCI<-as.numeric(simulated_data_long_plot_ext$predicted_log_phalate) + 1.96*as.numeric(simulated_data_long_plot_ext$predicted_log_phalate_se)
+```
+
+Plot the result
+
+```{r}
+ggplot(simulated_data_long_plot_ext, aes(x = as.numeric(time), y = as.numeric(predicted_log_phalate), group = Outcome_extremes, color = Outcome_extremes, linetype = Outcome_extremes)) +
+  geom_ribbon(aes(min=LCI, ymax = UCI), fill = "lightgrey", color = "lightgrey", stat = "smooth", method = "lm", formula = y ~ x + I(x^2)) +
+  geom_smooth(method = "lm", formula =y ~ x + I(x^2) ) 
+  
+```
+
